@@ -33,6 +33,8 @@ static int filter_pids(const struct dirent *dent)
 
 static int create_sqe(struct io_uring *ring, int procfd, int idx, const char *filename, Arena *arena)
 {
+    int count = 0;
+
     struct submit_data *data = arena_alloc(arena, sizeof(*data));
     assert(data != NULL);
     data->path = arena_sprintf(arena, "%s/status", filename);
@@ -44,12 +46,14 @@ static int create_sqe(struct io_uring *ring, int procfd, int idx, const char *fi
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (!sqe)
         return -1;
+    ++count;
     sqe->flags |= IOSQE_IO_LINK;
     io_uring_prep_openat_direct(sqe, procfd, data->path, O_RDONLY, 0, idx);
 
     struct io_uring_sqe *sqe2 = io_uring_get_sqe(ring);
     if (!sqe2)
         return -1;
+    ++count;
     sqe2->flags |= (IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK);
     io_uring_prep_read(sqe2, idx, data->buf, sizeof(data->buf), 0);
     io_uring_sqe_set_data(sqe2, data);
@@ -57,9 +61,10 @@ static int create_sqe(struct io_uring *ring, int procfd, int idx, const char *fi
     struct io_uring_sqe *sqe3 = io_uring_get_sqe(ring);
     if (!sqe3)
         return -1;
+    ++count;
     io_uring_prep_close_direct(sqe3, idx);
 
-    return 0;
+    return count;
 }
 
 static void close_fd(int *fd)
@@ -112,11 +117,14 @@ static GHashTable *get_pid_relationships(Arena *arena, pid_t pid)
         return NULL;
     }
 
+    int pending = 0;
     for (int i = 0; i < count; i++) {
-        if (create_sqe(&ring, procfd, i, namelist[i]->d_name, arena) < 0) {
+        int n_sqe = create_sqe(&ring, procfd, i, namelist[i]->d_name, arena);
+        if (n_sqe < 0) {
             fprintf(stderr, "io_uring too small!\n");
             abort();
         }
+        pending += n_sqe;
     }
 
     free_namelist(namelist, count);
@@ -136,11 +144,10 @@ static GHashTable *get_pid_relationships(Arena *arena, pid_t pid)
         return NULL;
     }
 
-    int pending = count;
     struct io_uring_cqe *cqes[count];
     GHashTable *pidmap = g_hash_table_new_full(NULL, NULL, NULL, (GDestroyNotify)g_list_free);
 
-    while (pending) {
+    while (pending > 0) {
         int n_cqes = io_uring_peek_batch_cqe(&ring, cqes, count);
         if (!n_cqes) {
             ret = io_uring_wait_cqe_nr(&ring, &cqes[0], pending);
@@ -160,7 +167,6 @@ static GHashTable *get_pid_relationships(Arena *arena, pid_t pid)
                     ring_perror(cqe->res, "cqe result");
                     goto err;
                 }
-                pending--;
             } else if (data) {
                 assert(cqe->res > 0);
                 pid_t ppid = parse_ppid(data->buf);
@@ -173,11 +179,10 @@ static GHashTable *get_pid_relationships(Arena *arena, pid_t pid)
                     } else
                         pids = g_list_append(pids, GUINT_TO_POINTER(data->pid));
                 }
-
-                pending--;
             }
 
             io_uring_cqe_seen(&ring, cqe);
+            pending--;
         }
     }
 
